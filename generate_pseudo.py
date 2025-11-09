@@ -2,7 +2,6 @@ import os
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-import stamps
 from scipy.sparse import diags
 from sklearn.cluster import k_means, AgglomerativeClustering
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances, pairwise_distances, \
@@ -104,230 +103,71 @@ def k_shape_clustering(stamps, features, classes, n_clusters=None, random_state=
     return output_classes, true_num, pseudo_num, 0
 
 
-def dp_means(stamps, features, classes, lam_scale=1.0, min_segment_len=5, max_iter=50, smoothing_window=5):
+def dp_means(stamps, features, classes, lam=3.5, max_iter=100):
     """
-    Improved DP-means for pseudo label generation with:
-      - adaptive lambda per video (based on median pairwise distances)
-      - vectorized distances computation
-      - temporal regularization: merge segments shorter than min_segment_len
-      - smoothing: sliding-window majority vote to increase frame-level accuracy
-
+    DP-means clustering for pseudo label generation
     Args:
-        stamps (array): indices of timestamps (frames with ground truth)
-        features (array): (L, D) features (frames x dim)
-        classes (array): (L,) ground truth labels for frames
-        lam_scale (float): multiplier for the adaptive lambda (tuneable)
-        min_segment_len (int): minimum acceptable segment length (frames)
-        max_iter (int): max iterations for dp-means
-        smoothing_window (int): odd integer window size for majority smoothing (if <=1 no smoothing)
-
-    Returns:
-        output_classes, true_num, pseudo_num, stop_iter
+        stamps (array): chỉ số timestamp (khung có nhãn thật)
+        features (array): đặc trưng (L, D)
+        classes (array): nhãn thật (L,)
+        lam (float): penalty tạo cụm mới
+        max_iter (int): số vòng lặp tối đa
     """
-    # ensure shapes
-    features = np.asarray(features)  # (L, D)
-    L, D = features.shape
-    if L == 0:
-        return np.zeros_like(classes) - 1, 0, 0, 0
+    n = len(features)
+    k = 1
+    mu = [np.mean(features, axis=0)]  # khởi tạo tâm đầu tiên
+    z = np.zeros(n, dtype=int)  # mỗi điểm ban đầu thuộc cụm
 
-    # --- Adaptive lambda ---
-    # compute a robust scale: median of pairwise distances between consecutive frames
-    # (cheap) instead of full pairwise NxN
-    if L > 1:
-        diff = features[1:] - features[:-1]
-        step_dists = np.sqrt((diff ** 2).sum(axis=1))
-        base_scale = np.median(step_dists) if step_dists.size > 0 else 0.0
-    else:
-        base_scale = 0.0
-    # fallback: if median is zero (flat), use global std of features
-    if base_scale <= 0:
-        base_scale = np.std(features)
-    # Adaptive lambda
-    lam = lam_scale * (base_scale ** 2) * D  # scale by dim to match squared-norm scale
-    if lam <= 0:
-        lam = lam_scale  # fallback small positive
+    iter_count = 0
 
-    # --- Initialization ---
-    # We'll use squared Euclidean distances and keep cluster centers in numpy arrays
-    centers = [features.mean(axis=0).copy()]  # list of D arrays
-    assignments = np.zeros(L, dtype=int)  # cluster id per frame, 0-index
-    K = 1
-
-    for it in range(max_iter):
+    for _ in range(max_iter):
         changed = False
 
-        # compute squared distances from all points to all centers in vectorized form
-        C = np.stack(centers, axis=0)  # (K, D)
-        # distances: (L, K) -> ||x||^2 + ||c||^2 - 2 x.c
-        x_norm2 = (features ** 2).sum(axis=1).reshape(-1, 1)  # (L,1)
-        c_norm2 = (C ** 2).sum(axis=1).reshape(1, -1)  # (1,K)
-        dists = x_norm2 + c_norm2 - 2.0 * (features @ C.T)  # (L,K)
-
-        # assign or create new cluster when min_dist > lam
-        min_dists = dists.min(axis=1)
-        argmin = dists.argmin(axis=1)
-        # frames that should create new cluster
-        new_mask = min_dists > lam
-        if new_mask.any():
-            # create new centers for these frames (one per unique position left-to-right to avoid explosion)
-            # To avoid creating too many clusters in a single pass, only create cluster at first occurrence in contiguous block
-            idxs = np.where(new_mask)[0]
-            # group contiguous idxs and create one center per contiguous run (helps temporal data)
-            runs = []
-            start = idxs[0]
-            prev = idxs[0]
-            for idx in idxs[1:]:
-                if idx == prev + 1:
-                    prev = idx
-                    continue
-                else:
-                    runs.append(start)
-                    start = idx
-                    prev = idx
-            runs.append(start)
-            for r in runs:
-                centers.append(features[r].copy())
-                K += 1
-                argmin[r] = K - 1
-                # mark changed for those points; we'll reassign others below
+        # --- Gán cụm ---
+        for i in range(n):
+            dists = [np.linalg.norm(features[i] - mu_c) ** 2 for mu_c in mu]
+            min_dist = np.min(dists)
+            if min_dist > lam:  # tạo cụm mới
+                mu.append(features[i])
+                z[i] = k
+                k += 1
                 changed = True
-
-            # recompute C and dists with new centers
-            C = np.stack(centers, axis=0)
-            c_norm2 = (C ** 2).sum(axis=1).reshape(1, -1)
-            dists = x_norm2 + c_norm2 - 2.0 * (features @ C.T)
-            min_dists = dists.min(axis=1)
-            argmin = dists.argmin(axis=1)
-
-        # update assignments
-        if not np.array_equal(assignments, argmin):
-            assignments = argmin.copy()
-            changed = True
-
-        # update centers
-        new_centers = []
-        for k in range(K):
-            members = features[assignments == k]
-            if len(members) > 0:
-                new_centers.append(members.mean(axis=0))
             else:
-                # keep old center if no members
-                new_centers.append(centers[k])
-        centers = new_centers
+                new_label = np.argmin(dists)
+                if z[i] != new_label:
+                    z[i] = new_label
+                    changed = True
+
+        # --- Cập nhật tâm cụm ---
+        for c in range(k):
+            members = features[z == c]
+            if len(members) > 0:
+                mu[c] = np.mean(members, axis=0)
 
         if not changed:
-            stop_iter = it + 1
             break
-    else:
-        stop_iter = max_iter
 
-    # --- Temporal regularization: merge short segments into neighbor with smallest centroid distance ---
-    out = assignments.copy()
-    # build segments (contiguous runs with same cluster id)
-    seg_starts = [0]
-    seg_ids = []
-    for i in range(1, L):
-        if out[i] != out[i-1]:
-            seg_starts.append(i)
-    seg_starts.append(L)
-    for s_i in range(len(seg_starts)-1):
-        seg_ids.append(out[seg_starts[s_i]])
+    print(f"[DP-means] Converged after {iter_count} iterations, total clusters: {k}")
 
-    # iterate segments, merge those shorter than min_segment_len
-    seg_starts_idx = seg_starts
-    seg_ids = np.array(seg_ids, dtype=int)
-    seg_lens = np.diff(seg_starts_idx)
-    if min_segment_len > 1 and len(seg_lens) > 0:
-        i = 0
-        while i < len(seg_lens):
-            if seg_lens[i] < min_segment_len:
-                # choose neighbor to merge into: left or right (prefer longer side); otherwise nearest center
-                left_valid = (i-1) >= 0
-                right_valid = (i+1) < len(seg_lens)
-                chosen = None
-                if left_valid and right_valid:
-                    # compare distance between centers or segment lengths
-                    left_center = centers[seg_ids[i-1]]
-                    right_center = centers[seg_ids[i+1]]
-                    cur_center = centers[seg_ids[i]]
-                    dl = np.sum((cur_center - left_center) ** 2)
-                    dr = np.sum((cur_center - right_center) ** 2)
-                    chosen = i-1 if dl <= dr else i+1
-                elif left_valid:
-                    chosen = i-1
-                elif right_valid:
-                    chosen = i+1
-                else:
-                    chosen = i  # single segment only
-
-                # perform merge: set cluster id of this segment to chosen's cluster id
-                seg_ids[i] = seg_ids[chosen]
-                # rebuild out assignments for merged segment
-                s = seg_starts_idx[i]
-                e = seg_starts_idx[i+1]
-                out[s:e] = seg_ids[i]
-
-                # after merge, recompute seg structure (simplest approach: rebuild arrays)
-                # rebuild seg_starts and seg_ids and seg_lens from out
-                seg_starts = [0]
-                seg_ids = []
-                for t in range(1, L):
-                    if out[t] != out[t-1]:
-                        seg_starts.append(t)
-                seg_starts.append(L)
-                for s_j in range(len(seg_starts)-1):
-                    seg_ids.append(out[seg_starts[s_j]])
-                seg_ids = np.array(seg_ids, dtype=int)
-                seg_lens = np.diff(seg_starts)
-                i = 0  # restart scanning (cheap since typical number of segments is small)
-                continue
-            i += 1
-
-    # --- Map each cluster to nearest stamp class (as before) ---
+    # --- Sinh nhãn giả ---
     output_classes = np.zeros_like(classes) - 1
     label2class = {}
-    unique_clusters = np.unique(out)
-    for c in unique_clusters:
-        indices = np.where(out == c)[0]
+
+    for j in range(k):
+        # Tìm timestamp gần nhất trong cụm
+        indices = np.where(z == j)[0]
         if len(indices) == 0:
             continue
-        # choose the stamp nearest in time to the cluster (as original), but also ensure index valid
-        # if none stamp inside, pick closest stamp by time distance
         closest_stamp = min(stamps, key=lambda s: np.min(np.abs(indices - s)))
-        label2class[c] = classes[closest_stamp]
-        output_classes[indices] = label2class[c]
+        label2class[j] = classes[closest_stamp]
+        for idx in indices:
+            output_classes[idx] = label2class[j]
 
-    # --- Smoothing (majority vote) to increase frame-level accuracy ---
-    if smoothing_window is not None and smoothing_window > 1:
-        w = int(smoothing_window)
-        if w % 2 == 0:
-            w += 1
-        half = w // 2
-        smoothed = output_classes.copy()
-        for i in range(L):
-            l = max(0, i - half)
-            r = min(L, i + half + 1)
-            window = output_classes[l:r]
-            # exclude -1 entries from voting (if any)
-            window_valid = window[window != -1]
-            if window_valid.size > 0:
-                # majority vote
-                vals, counts = np.unique(window_valid, return_counts=True)
-                smoothed[i] = vals[counts.argmax()]
-        output_classes = smoothed
-
-    # --- eval ---
     true_num, pseudo_num = eval_pseudo_labels(output_classes, classes)
-
-    # Ensure stamps preserved
     for each in stamps:
-        if output_classes[each] != classes[each]:
-            # force stamp label (very important)
-            output_classes[each] = classes[each]
+        assert classes[each] == output_classes[each]
 
-    return output_classes, true_num, pseudo_num, stop_iter
-
-
+    return output_classes, true_num, pseudo_num, 0
 
 
 def hdp(stamps, features, classes, lam_local=3.0, lam_global=6.0, max_iter=100):
@@ -743,7 +583,8 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', default="50salads", help='three dataset: breakfast, 50salads, gtea')
     parser.add_argument('--metric', default="euclidean", help='three metrics: euclidean, cosine, seuclidean')
     parser.add_argument('--feature', default="1024", help='1024 or 2048 or all')
-    parser.add_argument('--type', default="all",help='all, energy_function, constrained_k_medoids, temporal_agnes, dp_means, hdp, k_shape_clustering')
+    parser.add_argument('--type', default="all",
+                        help='all, energy_function, constrained_k_medoids, temporal_agnes, dp_means, hdp, k_shape_clustering')
 
     args = parser.parse_args()
 
@@ -809,7 +650,8 @@ if __name__ == "__main__":
 
         if args.type == 'all':
             output_classes1, true_num1, pseudo_num1, _ = energy_function(stamp, features, classes)
-            output_classes2, true_num2, pseudo_num2, _ = constrained_k_medoids(stamp, features, classes,metric=args.metric)
+            output_classes2, true_num2, pseudo_num2, _ = constrained_k_medoids(stamp, features, classes,
+                                                                               metric=args.metric)
             output_classes3, true_num3, pseudo_num3, _ = temporal_agnes(stamp, features, classes, metric=args.metric)
             # output_classes_add, _, _, _ = temporal_agnes(stamp, features, classes, metric=args.metric, linkage='max')
 
@@ -853,7 +695,8 @@ if __name__ == "__main__":
             total_length += len(classes)
 
         elif args.type == 'constrained_k_medoids':
-            output_classes, true_num, pseudo_num, _ = constrained_k_medoids(stamp, features, classes,metric=args.metric)
+            output_classes, true_num, pseudo_num, _ = constrained_k_medoids(stamp, features, classes,
+                                                                            metric=args.metric)
             print(vid.split('.')[0] + "    true num: {}, pseudo labels num: {}, length: {}, stop iter: {}".format(
                 true_num, pseudo_num, len(classes), 0))
             total_true += true_num
@@ -869,8 +712,7 @@ if __name__ == "__main__":
             total_length += len(classes)
 
         elif args.type == 'dp_means':
-            output_classes, true_num, pseudo_num, stop_iter = dp_means(stamps, features, classes, lam_scale=0.8)
-
+            output_classes, true_num, pseudo_num, _ = dp_means(stamp, features, classes)
             print(
                 f"{vid.split('.')[0]}    true num: {true_num}, pseudo labels num: {pseudo_num}, length: {len(classes)}, stop iter: 0")
             total_true += true_num
